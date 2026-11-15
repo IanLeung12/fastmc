@@ -1,111 +1,193 @@
 # lockoutserver
 
-Automated setup for a Minecraft 1.21.11 Fabric server on AWS EC2.
+Launch and manage Fabric Minecraft servers on AWS EC2 from the command line. A server's mod set (Lockout, Shared Health, …) is picked at launch from a **profile**, and everything else, from the instance type to the world seed, is a launch flag.
 
-> Looking for the **Shared Health** server (Minecraft 26.2)? See [`sharedhealth/`](sharedhealth/README.md).
+```bash
+bin/mc launch --profile lockout --name friday --seed 12345
+```
+
+The command creates the instance, installs Java, Fabric and the mods, starts the server and prints the IP to connect to.
 
 ## Repo Structure
 
 ```
 lockoutserver/
+├── bin/
+│   ├── mc               # the CLI (runs on your machine)
+│   └── lib/             # config.sh → render.sh → aws.sh, plus commands.sh
+├── profiles/            # one KEY=value file per mod set
+│   ├── lockout.conf
+│   └── sharedhealth.conf
 ├── mods/
-│   ├── fabric-api-0.141.3+1.21.11.jar
-│   ├── lithium-fabric-0.21.4+mc1.21.11.jar
-│   └── lockout-fabric-0.12.2.jar
-├── scripts/
-│   ├── userdata.sh    # paste into EC2 "User data" at launch
-│   ├── start.sh       # start the server
-│   └── newworld.sh    # archive current world and generate a new one
-└── README.md
+│   ├── 1.21.11/         # jars, grouped by Minecraft version
+│   └── 26.2/
+├── server/              # runs on the instance, works with any profile
+│   ├── setup.sh         # first-boot install
+│   ├── common.sh        # shared helpers
+│   ├── start.sh
+│   ├── stop.sh
+│   └── newworld.sh
+└── .env.example         # copy to .env
 ```
 
 ---
 
-## Creating a New Server
+## Setup (once)
 
-### 1. Launch an EC2 Instance
-- **Region:** `ca-central-1` (Canada) or whichever is closest to your players
-- **AMI:** Ubuntu Server 24.04 LTS (64-bit x86)
-- **Instance type:** `c7i.xlarge` (4 vCPU / 8 GB) recommended. `m7i.large` (2 vCPU / 8 GB) is the budget option.
-  - **Avoid the `t3` family.** It is burstable: a `t3.medium` ran at ~95% CPU with a small group and, once its CPU credits run out, it gets throttled and the server starts lagging.
-  - Minecraft is mostly single-threaded, so a high clock speed matters more than core count. The `c7i`/`m7i` (Intel) or `c7a`/`m7a` (AMD) families are all fine.
-  - The default view distance is 20 chunks, which needs the 8 GB. If you drop to a 4 GB instance, lower `view-distance` in `server.properties` to 10–12.
-- **Key pair:** select or create one — you need it to SSH in
-- **Network settings → Edit → Add security group rule:**
-  - Type `Custom TCP`, Port `25565`, Source `0.0.0.0/0` (so your friends can connect)
-  - Type `Custom UDP`, Port `24454`, Source `0.0.0.0/0` (for the voice chat mod)
-  - Keep the default SSH rule on port 22
-- **Configure storage:** 20 GB gp3 (the default 8 GB fills up fast with worlds)
-- **Advanced details → User data:** paste the contents of `scripts/userdata.sh`
-- Click **Launch instance**
+1. **Install the AWS CLI v2** and sign in. A named profile is easiest:
+   ```bash
+   aws configure --profile mc
+   ```
+   On Windows, run `bin/mc` from **Git Bash**.
+2. **Create your `.env`:**
+   ```bash
+   cp .env.example .env
+   ```
+   Set `AWS_PROFILE` (e.g. `mc`), `AWS_REGION`, and your Minecraft username in `OPS`. `.env` is gitignored.
 
-The instance will automatically install Java, download Fabric, pull the mods and scripts from this repo, and be ready to go by the time it finishes booting (~3–5 min).
-
-### 2. Check Setup Completed
-```bash
-ssh -i <YOUR_KEY>.pem ubuntu@<YOUR_PUBLIC_IP>
-```
-```bash
-tail -f /var/log/mc-setup.log
-```
-The last line will read `Setup complete!` when finished. If a mod fails to download or arrives corrupt, setup stops there and the log says which one.
-
-### 3. Start the Server
-```bash
-bash /home/ubuntu/minecraft/start.sh
-```
-
-RAM is allocated automatically (total RAM minus 1 GB reserved for the OS).
-
-Default `server.properties` written at setup: `view-distance=20`, `simulation-distance=10`. Edit the file and restart the server to change them.
-
-Players connect to the instance's **public IPv4 address** on the default port. Note that this address changes every time the instance is stopped and started — attach an Elastic IP if you want it to stay put.
+The SSH key pair is created on first launch and saved to `KEY_PATH` (`~/.ssh/lockoutserver.pem` by default). If you launch in a new region later, the same key is imported there.
 
 ---
 
-## Managing the Server
+## Launching a Server
+
+```bash
+bin/mc launch                                   # default profile from .env
+bin/mc launch --profile sharedhealth --name hc  # another mod set
+bin/mc launch --type m7i.large --view-distance 12 --motd "Friday Lockout"
+bin/mc launch --prop pvp=false --prop spawn-protection=0
+bin/mc launch --dry-run ...                     # show the resolved config, launch nothing
+```
+
+When it finishes (~5–8 minutes on first boot), you get:
+
+```
+friday is up (profile: lockout)
+  Connect:   3.98.x.x  (port 25565)
+  Ports:     tcp 25565, udp 24454
+  SSH:       bin/mc ssh friday
+  Console:   bin/mc console friday
+  ...
+```
+
+Run `bin/mc launch --help` for every flag. In short:
+
+| Area | Flags |
+|---|---|
+| Server | `--name`, `--profile`, `--mod JAR`, `--no-mod JAR`, `--ref REF` |
+| Instance | `--region`, `--type`, `--disk GB`, `--spot`, `--elastic-ip` |
+| World | `--seed`, `--gamemode`, `--difficulty`, `--hardcore`, `--max-players`, `--motd`, `--view-distance`, `--sim-distance`, `--level-type`, `--prop KEY=VALUE` |
+| Players | `--ops "a,b"`, `--whitelist "a,b"` |
+| Other | `--dry-run`, `--render-only` |
+
+The server name defaults to the profile name, so a second server with the same profile needs `--name`.
+
+### Where settings come from
+
+From lowest to highest precedence:
+
+**built-in defaults → `profiles/<profile>.conf` → `.env` → launch flags**
+
+Each layer overrides the one before, except `PROPS` (server.properties), which **adds up**: the defaults set `view-distance=20;simulation-distance=10`, a profile adds e.g. `hardcore=true`, and `--prop` adds more. When a key appears twice, the last one wins.
+
+---
+
+## Managing a Server
 
 | Action | Command |
 |---|---|
-| Start server | `bash /home/ubuntu/minecraft/start.sh` |
-| Attach to console | `screen -r mc` |
-| Detach from console | `Ctrl + A` then `D` |
-| Stop server safely | Attach, then type `stop` |
-| New world | `bash /home/ubuntu/minecraft/newworld.sh` |
+| List servers | `bin/mc list` |
+| SSH in | `bin/mc ssh <name>` |
+| Attach to console | `bin/mc console <name>` (detach: `Ctrl + A` then `D`) |
+| Follow setup log | `bin/mc logs <name>` (game log: `--game`) |
+| New world | `bin/mc newworld <name>` |
+| Download worlds | `bin/mc backup <name>` → `backups/` |
+| Stop instance | `bin/mc stop <name>` (world is saved; disk still billed) |
+| Start instance | `bin/mc start <name>` (prints the new IP) |
+| Terminate everything | `bin/mc destroy <name>` |
+| SSH from a new IP | `bin/mc allow-ip <name>` |
+
+`<name>` can be left out when only one server exists (except for `destroy`). Every command takes `--region`.
+
+### On the server
+
+You have the same control as before. The server runs in the `mc` screen session and starts automatically on boot:
+
+| Action | Command |
+|---|---|
+| Start server | `bash ~/minecraft/start.sh` (or `sudo systemctl restart minecraft`) |
+| Stop server safely | `bash ~/minecraft/stop.sh`, or attach and type `stop` |
+| Attach / detach | `screen -r mc` / `Ctrl + A` then `D` |
+| New world | `bash ~/minecraft/newworld.sh` |
+| Setup log | `tail -f /var/log/mc-setup.log` |
+
+RAM is allocated automatically (total RAM minus 2 GB for the OS). `newworld.sh` archives the current world as `world_YYYYMMDD_HHMMSS`. Old worlds are never deleted automatically. If you launched with `--seed`, the new world uses the same seed unless you change `level-seed` in `server.properties`.
 
 ---
 
-## Starting a New World
+## Profiles
+
+A profile is a plain `KEY=value` file in `profiles/`. It can set any config key, but usually only sets what makes the mod set different:
 
 ```bash
-bash /home/ubuntu/minecraft/newworld.sh
+# profiles/sharedhealth.conf
+MC_VERSION=26.2
+FABRIC_INSTALLER_VERSION=1.1.2
+JAVA_VERSION=25
+MODS="fabric-api-0.160.0+26.2.jar lithium-fabric-0.25.3+mc26.2.jar sharedhealth-1.2.12.jar"
+PORTS="tcp:25565"
+PROPS="hardcore=true;difficulty=hard"
 ```
 
-This will:
-1. Warn players in chat
-2. Stop the server gracefully
-3. Archive the current world as `world_YYYYMMDD_HHMMSS`
-4. Start the server fresh with a new world
+- `MODS` and `PORTS` are space-separated. `PROPS` is `;`-separated because values like `motd` can contain spaces.
+- Java is always Eclipse Temurin `JAVA_VERSION` from the Adoptium repo.
+- Profiles and `.env` are **data, not shell scripts**: no `$`, quotes inside values, backticks, backslashes or inline comments. Unknown keys are rejected, so typos fail loudly.
 
-Old worlds are kept on the server and never deleted automatically.
+### Adding a profile or updating mods
+
+1. Put the jars in `mods/<MC_VERSION>/`.
+2. Add or edit `profiles/<name>.conf`.
+3. **Push the jars.** Instances download mods from GitHub at `REPO_REF` (default `main`). To test from a branch, push it and launch with `--ref <branch>`. `launch` checks that every mod is downloadable before creating anything.
+
+Changes to `server/` scripts don't need a push. They're embedded into the instance's user data from your local checkout, and `launch` warns if they're uncommitted.
+
+---
+
+## How It Works
+
+- **`bin/mc launch`** resolves the config, renders EC2 user data (gzipped) and calls the AWS CLI: latest Ubuntu 24.04 AMI from SSM, a security group `mc-<name>` (game ports open to everyone, SSH only to your IP), and the instance with a gp3 root volume.
+- **The user data** writes `server.env` (the resolved profile) and the `server/` scripts to `~/minecraft`, then runs `setup.sh`. That installs Java, Fabric and the mods, writes `server.properties`, `ops.json` and `whitelist.json`, and installs a `minecraft` systemd service.
+- **Everything is tagged** `Project=lockoutserver`, `Name=<name>`, `Profile=<profile>`. Commands find servers by tag, so there's no local state, and anything launched from any machine shows up in `bin/mc list`.
+- **`destroy`** cancels any spot request, terminates the instance, and deletes the security group and Elastic IP. Run it with a name that has no instance to clean up leftovers from a failed launch.
+
+### Launching from the EC2 console instead
+
+`bin/mc launch --render-only [flags] > userdata.sh` prints the user data. It's slightly over the console's 16 KB limit as plain text, so paste the output of `... | gzip -9 | base64 -w0` and tick **"User data has already been base64 encoded"**. Open the profile's `PORTS` and SSH in the security group yourself.
+
+---
+
+## Choosing an Instance Type
+
+- **`c7i.xlarge`** (4 vCPU / 8 GB) is the default. **`m7i.large`** (2 vCPU / 8 GB) is the budget option.
+- **Avoid the `t3` family.** It is burstable: a `t3.medium` ran at ~95% CPU with a small group and, once its CPU credits ran out, got throttled and lagged.
+- Minecraft is mostly single-threaded, so clock speed matters more than core count. The `c7i`/`m7i` (Intel), `c7a`/`m7a` (AMD) and `c7g`/`m7g` (Graviton, ARM) families all work. `launch` picks the right AMI for ARM types.
+- View distance 20 needs the 8 GB. On a 4 GB instance, use `--view-distance 10`. `launch` warns about this.
+- `--spot` is much cheaper but AWS can interrupt it. The instance stops (world saved) rather than being deleted, and `bin/mc start` brings it back.
 
 ---
 
 ## Client Setup (Players)
 
-- **Required:** Vanilla Minecraft client set to version **1.21.11**
-- **Optional (better FPS):** Install a local Fabric 1.21.11 profile and add [Sodium](https://modrinth.com/mod/sodium) to your local `.minecraft/mods/` folder
+- **Required:** a vanilla Minecraft client on the profile's version (**1.21.11** for Lockout, **26.2** for Shared Health).
+- **Lockout:** install [Simple Voice Chat](https://modrinth.com/plugin/simple-voice-chat) on a local Fabric profile to use voice chat.
+- **Optional (better FPS):** a local Fabric profile with [Sodium](https://modrinth.com/mod/sodium).
 
 ---
 
-## Teardown (Stop Billing)
+## Costs
 
-Go to **EC2 Console → Instances → select the instance → Instance state → Terminate instance**.
+An instance bills **until it's stopped or terminated**. Closing your terminal or stopping Minecraft doesn't stop billing.
 
-> Closing your terminal or stopping the Minecraft process does **not** stop billing. **Stopping** the instance halts compute charges but you still pay for the EBS volume; **terminating** it stops everything and deletes the world. Copy off any worlds you want to keep first.
-
----
-
-## Updating Mods or Scripts
-
-Push new files to this repo — every new instance launched after that will automatically get the latest versions via `scripts/userdata.sh`.
+- `bin/mc stop` halts compute charges, but you still pay for the disk.
+- `bin/mc destroy` stops all charges and deletes the worlds (it offers to download them first).
+- `bin/mc list` shows everything still running in the region.
