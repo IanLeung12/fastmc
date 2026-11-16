@@ -1,0 +1,31 @@
+#!/bin/bash
+# lockoutserver CLI — launch and manage Minecraft servers on EC2.
+# Run `bin/mc help` for commands. Settings come from .env (see .env.example).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+for lib in util config render aws commands; do
+    # shellcheck source=/dev/null
+    . "$REPO_ROOT/bin/lib/$lib.sh"
+done
+
+COMMAND="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$COMMAND" in
+    launch)        cmd_launch "$@" ;;
+    list|ls)       cmd_list "$@" ;;
+    ssh)           cmd_ssh "$@" ;;
+    console)       cmd_console "$@" ;;
+    logs)          cmd_logs "$@" ;;
+    newworld)      cmd_newworld "$@" ;;
+    backup)        cmd_backup "$@" ;;
+    stop)          cmd_stop "$@" ;;
+    start)         cmd_start "$@" ;;
+    destroy)       cmd_destroy "$@" ;;
+    allow-ip)      cmd_allow_ip "$@" ;;
+    help|-h|--help) usage ;;
+    *)             usage >&2; die "Unknown command: $COMMAND" ;;
+esac
