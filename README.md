@@ -1,4 +1,4 @@
-# lockoutserver
+# fastmc
 
 Launch and manage Fabric Minecraft servers on AWS EC2 from the command line. A server's mod set (Lockout, Shared Health, …) is picked at launch from a **profile**, and everything else, from the instance type to the world seed, is a launch flag.
 
